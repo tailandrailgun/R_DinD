@@ -1,0 +1,298 @@
+---
+title: "DinD"
+author: ""
+date: ""
+output:
+  html_document:
+    theme: flatly
+    highlight: pygments
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# knitr globals
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.pos = "H",
+	warning = FALSE,
+	message = FALSE
+)
+
+# Set the graphical theme
+ggplot2::theme_set(ggplot2::theme_light())
+
+# load libraries -- install if required
+library(tidyverse)
+library(AER)
+library(haven)
+library(tidycensus)
+library(modelsummary)
+library(fixest)
+library(kableExtra)
+```
+
+
+<div class="alert alert-info">
+  <strong>Group Members:</strong> 
+(1.) Jian Hao Chiah
+(2.) Yunus Emre Bozkurt
+(3.) Nashita Behroz Jalil
+</div>
+
+
+# Difference-in-Difference: Minimum legal drinking age laws
+
+[Based on Chapter 5 of Mastering Metrics](https://github.com/robert8138/causal-inference/blob/master/Mastering-Metrics.pdf)
+
+Introduction
+
+Since 1933, the end of the prohibition, most States had a minimum legal drinking age (MLDA) limit of 21, but there were a few exceptions.  After 1971, an amendment to the constitution that lowered the age to vote to 18 and outrage following the Vietnam war, led many states to lower the MLDA to 18.  In 1984, in response to the 'Mothers Against Drunk Driving' lobby group, the Federal government put pressure on States to increase the MLDA to 21.  By the 1990s, all states had done so.
+
+This question investigates whether restricting youth access to alcohol has impacts on motor vehicle death rates for young people.  We restrict attention on death rates of those 18-20 (the age group impacted by the policy of raising the MLDA).  The key variable is `legal1820`, indicating the fraction of 18-20 year olds in a state that can buy alcohol legal.  This will be 1 if the MLDA is 18, and 0 if it is 21 for an entire year. For states that changed mid-way through the year, the variable is scaled.  Many States had MLDA ages between this range. We exploit the over-time, within-state variation in an difference-in-difference design.  
+
+## Data
+
+Below is a link to download the data for this example.  The data come in long or `tidy` format. This means that there is one observation per row.  This format is perfect for figures, so we will begin by probing the data graphically. 
+
+```{r}
+# load data
+mlda <- read_dta("http://masteringmetrics.com/wp-content/uploads/2015/01/deaths.dta")
+```
+
+
+```{r, echo = TRUE}
+df <- mlda %>% 
+  filter(year <= 1990) %>% 
+  mutate(dtype = as_factor(dtype, levels = "labels"), # convert dtype to factor
+         age_cat = agegr,                             # preserve numerical age cat.
+         agegr = as_factor(agegr, levels = "labels")) # convert agegr to factor.
+
+
+# Ichange the state from fips code to state name/abbrevation, 
+data("fips_codes")
+
+# load fips codes, change character to numeric
+fips_codes <- fips_codes %>% 
+  mutate(state_code = as.numeric(state_code)) %>% 
+  select(state, state_code) %>% 
+  distinct()
+
+# join with mlda data
+df <- df %>% 
+  rename(state_code = state) %>% 
+  right_join(fips_codes, by = "state_code") %>% 
+  select(-state_code) %>% 
+
+#remove NA values from "agegr"
+  filter(!is.na(agegr))
+
+```
+
+
+## Figures
+
+To get an idea of death rates for different age groups at the national level.
+
+We replicated the following figures: 
+
+![](https://raw.githubusercontent.com/ben-sand/ben-sand.github.io/master/fig_did.png)
+![](https://raw.githubusercontent.com/ben-sand/ben-sand.github.io/master/fig1_did.png)
+![](https://raw.githubusercontent.com/ben-sand/ben-sand.github.io/master/fig3_did.png)
+Replications:
+
+```{r, echo = TRUE}
+fig1 <- df %>% 
+group_by(agegr, dtype, year) %>% 
+summarise(deathrate = weighted.mean(mrate, pop, na.rm=T),
+          n = n())
+```
+```{r, echo = TRUE}
+fig2 <- df %>% 
+group_by(agegr, year) %>% 
+summarise(deathrate = weighted.mean(mrate, pop, na.rm=T),
+          n = n())
+```
+```{r, echo = TRUE}
+fig3 <- df %>% 
+group_by(state, year) %>% 
+summarise(frac1820 = weighted.mean(legal1820, pop, na.rm=T),
+          n = n())  
+```
+
+```{r, echo = TRUE}
+ggplot(fig1,
+       aes(x = year,
+           y = deathrate,
+           colour = dtype,
+           linetype = dtype
+       )) +
+  labs(title = "Death rates by causes and age group",
+       x = "Year",
+       y = "Death rates from all causes") +
+  geom_line() +
+  facet_wrap(~ agegr)
+          
+```
+
+```{r, echo = TRUE}
+ggplot(fig2,
+       aes(x = year,
+           y = deathrate,
+           colour = agegr,
+           linetype = agegr
+       )) +
+  labs(title = "Death rates from all causes",
+       x = "Year",
+       y = "Death rate per 100,000") +
+  geom_line() 
+          
+```
+
+```{r, echo = TRUE}
+library(tidyquant)
+ggplot(fig3,
+       aes(x = year,
+           y = frac1820)) +
+  facet_wrap(~state,
+           scales = "free") +
+  geom_ma(n=7) +
+  labs(
+    y = "Fraction of 18-20 yrs exposed",
+    x = "Year",
+    title = "Fraction of 18-20 yrs exposed to legal drinking")
+```
+
+
+
+## Difference-in-Difference (DinD)
+
+Since the data is a panel on states that vary the drinking age limit, a difference-in-differences strategy to estimate the effect on drinking age limits on death rates seems natural here.  There are actually two policies: the first is the 1971 change in the constitution allowing states to lower drinking age limits, that we will assume became effective in 1975 (so the post period is `year >= 1975`) and the second change was the 1984 law that punished states for lot increasing age limits.  We will focus on the first policy.
+
+
+```{r, echo = TRUE}
+#data work here
+df2 <- df %>% 
+  group_by(state, dtype) %>% 
+  
+  filter(year <= 1983,
+         agegr == "18-20 yrs") %>% 
+  
+  mutate(post = ifelse(year >= 1975, 1,0),
+         period  = ifelse(post == 1, "After","Before"),
+         treat = ifelse(legal1820[year == 1971] != legal1820[year == 1979], 1, 0))
+ 
+```
+
+### Simple DinD
+```{r, echo = TRUE}
+# simple d-in-d here
+
+models_1 <- list(
+reg1 <- feols(mrate ~ treat*post, data = df2, vcov = ~state),
+reg2 <- feols(mrate ~ treat*post + beertaxa + totpercap, data = df2, vcov = ~state),
+reg3 <- feols(mrate ~ treat*post, weights = ~pop, data = df2, vcov = ~state),
+reg4 <- feols(mrate ~ treat*post + beertaxa + totpercap, weights = ~pop, data = df2, vcov = ~state
+))
+
+modelsummary(models_1,
+             stars = T, 
+             gof_omit = '[^R2|Num.Obs]') %>% 
+  kable_classic_2()
+
+```
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+
+The estimates for the "post" variables in all Models (Model 1-4) are negative and are all statistically significant. (starred) From these results, we found that when some states increased the drinking age limit, this decreases the deaths. This implies that indeed the change in policy has a causal effect on deaths caused by drinking and driving. 
+
+The estimates for the models with the weighted data (Model 3, 4) are less than the models without weighted data. The estimates in models with weighted data have less standard errors, meaning that coefficients estimates are "healthy". 
+
+</div>
+
+### Generalized DinD
+
+```{r, echo = TRUE}
+# generalized d-in-d here
+
+models_2 <- list(
+gend1 <- feols(mrate ~ treat*post + ..("pct") | state + year, 
+               data   =  df2,
+               vcov   = ~ state),
+
+gend2 <- feols(mrate ~ treat*post + beertaxa + totpercap + ..("pct")| state + year, 
+               data   =  df2,
+               vcov   = ~ state),
+
+gend3 <- feols(mrate ~ treat*post + ..("pct") | state + year, 
+               data   =  df2,
+               weight = ~ pop,
+               vcov   = ~ state),
+
+gend4 <- feols(mrate ~ treat*post + beertaxa + totpercap + ..("pct")| state + year, 
+               data   =  df2,
+               weight = ~ pop,
+               vcov   = ~ state)
+)
+
+modelsummary(models_2,
+             stars = T, 
+             gof_omit = '[^R2|Num.Obs]') %>% 
+  kable_classic_2()
+
+```
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+
+By fixing state & year, the change in policy does not help us to explain the variation in death rates, since we do not observe any statistically significant estimates in any of the models above. 
+
+</div>
+
+
+## Falsification
+
+Causal effect check: replacing the dependent variable with another variable that should not be affected by the policy. 
+
+```{r, echo = TRUE}
+df3 <- df2 %>% 
+  filter(dtype == "internal")
+```
+
+```{r, echo = TRUE}
+# falsification here  here
+
+models_3 <- list(
+gend1 <- feols(mrate ~ treat*post + ..("pct") | state + year, 
+               data   =  df3,
+               vcov   = ~ state),
+
+gend2 <- feols(mrate ~ treat*post + beertaxa + totpercap + ..("pct")| state + year, 
+               data   =  df3,
+               vcov   = ~ state),
+
+gend3 <- feols(mrate ~ treat*post + ..("pct") | state + year, 
+               data   =  df3,
+               weight = ~ pop,
+               vcov   = ~ state),
+
+gend4 <- feols(mrate ~ treat*post + beertaxa + totpercap + ..("pct")| state + year, 
+               data   =  df3,
+               weight = ~ pop,
+               vcov   = ~ state)
+)
+
+modelsummary(models_3,
+             stars = T, 
+             gof_omit = '[^R2|Num.Obs]') %>% 
+  kable_classic_2()
+
+```
+<div class="alert alert-info">
+  <strong>Note :</strong> 
+
+We have replaced the dependent variable with "deaths from causes unrelated to drinking and driving" -- which is referred to as "internal causes' from the textbook source. With this new dependent variable, this falsification procedure has showed that change in policy DO NOT HAVE causal effect on deaths caused by internal causes instead of drinking and driving. In other words, <b>change in policy do not have causal effect on deaths that are not caused by drinking and driving. </b>
+
+The application of Falsification Principle here has helped us to test and prove that the previous two DinD that we have constructed are proper and acceptable. 
+We can observe from our regression result here that none of our coefficient estimates are statistically significant, which further proves the statement listed above. This is based on our observation that although "stars = T" is applied in our commands, there is no stars associated estimates in the shown figure.
+
+The estimates for "treat*post" variable are not statistically significant in all Models 1-4. This proves that the change in policy does not affect the deaths caused by internal causes. 
+</div>
